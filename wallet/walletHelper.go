@@ -104,7 +104,9 @@ func (w *WalletHelper) CalculateNetworkFee(trx *tx.Transaction) (uint64, error) 
 
 	exec_fee_factor := int64(30)
 	nf := uint64(0)
+	index := -1
 	for _, hash := range hashes {
+		index++
 		var witness_script []byte
 		account := w.wallet.GetAccountByScriptHash(&hash)
 		if account != nil {
@@ -113,23 +115,75 @@ func (w *WalletHelper) CalculateNetworkFee(trx *tx.Transaction) (uint64, error) 
 				witness_script = c.GetScript()
 			}
 		}
+		var invocationScript []byte
 
-		if witness_script == nil && trx.GetWitnesses() != nil {
-			// try to find the script in the witnesses
-			for _, witness := range trx.GetWitnesses() {
-				if witness.GetScriptHash().Equals(&hash) {
-					witness_script = witness.VerificationScript
-					break
+		if len(trx.GetWitnesses()) != 0 {
+			if witness_script == nil {
+				// try to find the script in the witnesses
+				witness := trx.GetWitnesses()[index]
+				witness_script = witness.VerificationScript
+				if len(witness_script) == 0 {
+					// Then it's a contract-based witness, so try to get the corresponding invocation script for it
+					invocationScript = witness.InvocationScript
 				}
 			}
 		}
 
 		if witness_script == nil {
-			// todo, NativeContract case
-			continue
+			contractState, err := w.GetContractState(&hash)
+			if err != nil {
+				return 0, err
+			}
+			if contractState == nil {
+				return 0, fmt.Errorf("the smart contract or address %s is not found", hash.String())
+			}
+			md := -1
+			for i, method := range contractState.Manifest.Abi.Methods {
+				if method.Name == "verify" {
+					if len(method.Parameters) == 0 {
+						if method.ReturnType != "Boolean" {
+							return 0, fmt.Errorf("the verify method doesn't return boolean value")
+						}
+						md = i
+						break
+					}
+				}
+			}
+			if md == -1 {
+				return 0, fmt.Errorf("the smart contract %s haven't got verify method without arguments", hash.String())
+			}
+
+			// Empty verification and non-empty invocation scripts
+			if invocationScript != nil {
+				size += sc.ByteSlice([]byte{}).GetVarSize() + sc.ByteSlice(invocationScript).GetVarSize()
+			} else {
+				size += sc.ByteSlice([]byte{}).GetVarSize() + sc.ByteSlice([]byte{}).GetVarSize()
+			}
+
+			rpcSigner := models.RpcSigner{
+				Account:          hash.String(),
+				Scopes:           tx.CalledByEntry.String(), // CalledByEntry not sure
+			}
+			res := w.Client.InvokeFunction(hash.String(), "verify", []models.RpcContractParameter{}, []models.RpcSigner{rpcSigner})
+			if res.HasError() {
+				return 0, fmt.Errorf(res.GetErrorInfo())
+			}
+			if res.Result.State == "FAULT" {
+				return 0, fmt.Errorf("the smart contract %s verification failed", hash.String())
+			}
+			stack := res.Result.Stack[0]
+			stack.Convert()
+			if stack.Type != "Boolean" || stack.Value.(string) != "true" {
+				return 0, fmt.Errorf("the smart contract %s returns false", hash.String())
+			}
+			gasConsumed, err := strconv.ParseInt(res.Result.GasConsumed, 10, 64)
+			if err != nil {
+				return 0, err
+			}
+			nf += uint64(gasConsumed)
 		} else if sc.IsSignatureContract(witness_script) {
 			size += 67 + sc.ByteSlice(witness_script).GetVarSize()
-			nf += uint64(exec_fee_factor * (sc.OpCodePrices[sc.PUSHDATA1] + sc.OpCodePrices[sc.PUSHDATA1] + sc.OpCodePrices[sc.PUSHNULL] + tx.ECDsaVerifyPrice))
+			nf += uint64(exec_fee_factor * (sc.OpCodePrices[sc.PUSHDATA1] + sc.OpCodePrices[sc.PUSHDATA1] + sc.OpCodePrices[sc.SYSCALL] + tx.ECDsaVerifyPrice))
 		} else if b, m, n, _ := sc.IsMultiSigContract(witness_script); b {
 			size_inv := 66 * m
 			size += helper.GetVarSize(size_inv) + size_inv + sc.ByteSlice(witness_script).GetVarSize()
@@ -146,7 +200,7 @@ func (w *WalletHelper) CalculateNetworkFee(trx *tx.Transaction) (uint64, error) 
 			script, _ = sb.ToArray()
 			nf += uint64(exec_fee_factor * sc.OpCodePrices[sc.OpCode(script[0])])
 
-			nf += uint64(exec_fee_factor * (sc.OpCodePrices[sc.PUSHNULL] + int64(tx.ECDsaVerifyPrice*n)))
+			nf += uint64(exec_fee_factor * (sc.OpCodePrices[sc.SYSCALL] + int64(tx.ECDsaVerifyPrice*n)))
 		} else {
 			// support more cotnract types in the future
 		}
@@ -270,7 +324,7 @@ func (w *WalletHelper) GetBalanceFromWallet(assetHash *helper.UInt160, wlt *NEP6
 func (w *WalletHelper) GetBlockHeight() (uint32, error) {
 	response := w.Client.GetBlockCount()
 	if response.HasError() {
-		return 0, fmt.Errorf(response.Error.Message)
+		return 0, fmt.Errorf(response.GetErrorInfo())
 	}
 	count := uint32(response.Result)
 	return count - 1, nil // height = index = count - 1, genesis block is index 0
@@ -279,17 +333,19 @@ func (w *WalletHelper) GetBlockHeight() (uint32, error) {
 func (w *WalletHelper) GetContractState(hash *helper.UInt160) (*models.RpcContractState, error) {
 	response := w.Client.GetContractState(hash.String())
 	if response.HasError() {
-		return nil, fmt.Errorf(response.Error.Message)
+		return nil, fmt.Errorf(response.GetErrorInfo())
 	}
 	return &response.Result, nil
 }
 
 // GetGasConsumed runs a script in ApplicationEngine in test mode and returns gas consumed
 func (w *WalletHelper) GetGasConsumed(script []byte, signers []models.RpcSigner) (int64, error) {
-	fmt.Println(crypto.Base64Encode(script))
 	response := w.Client.InvokeScript(crypto.Base64Encode(script), signers)
 	if response.HasError() {
-		return 0, fmt.Errorf(response.Error.Message)
+		return 0, fmt.Errorf(response.GetErrorInfo())
+	}
+	if response.Result.State == "FAULT" {
+		return 0, fmt.Errorf("engine faulted: %s", response.Result.Exception)
 	}
 	gasConsumed, err := strconv.ParseInt(response.Result.GasConsumed, 10, 64)
 	if err != nil {
@@ -307,7 +363,7 @@ func (w *WalletHelper) GetUnClaimedGas() (uint64, error) {
 	for _, account := range w.wallet.accounts {
 		response := w.Client.GetUnclaimedGas(account.Address)
 		if response.HasError() {
-			return 0, fmt.Errorf(response.Error.Message)
+			return 0, fmt.Errorf(response.GetErrorInfo())
 		}
 		u, err := strconv.ParseUint(response.Result.Unclaimed, 10, 64)
 		if err != nil {
@@ -391,7 +447,11 @@ func (w *WalletHelper) Sign(ctx *ContractParametersContext, magic uint32) (bool,
 					if err != nil {
 						return false, err
 					}
-					addSigSuccess, err := ctx.AddSignature(msc.ToContract(), pair.PublicKey, signature)
+					ctr, err := account.GetContract().ToContract()
+					if err != nil {
+						return false, err
+					}
+					addSigSuccess, err := ctx.AddSignature(ctr, pair.PublicKey, signature)
 					if err != nil {
 						return false, err
 					}
@@ -414,7 +474,11 @@ func (w *WalletHelper) Sign(ctx *ContractParametersContext, magic uint32) (bool,
 				if err != nil {
 					return false, err
 				}
-				addSigSuccess, err := ctx.AddSignature(account.GetContract().ToContract(), pair.PublicKey, signature)
+				ctr, err := account.GetContract().ToContract()
+				if err != nil {
+					return false, err
+				}
+				addSigSuccess, err := ctx.AddSignature(ctr, pair.PublicKey, signature)
 				if err != nil {
 					return false, err
 				}
